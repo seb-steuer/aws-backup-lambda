@@ -278,8 +278,14 @@ class RDSBackupManager(BaseBackupManager):
     def get_resource_tags(self, resource):
         resource_id = self.resolve_backupable_id(resource)
         resource_tags = {}
+
+        if 'DBClusterIdentifier' in resource:
+            rds_type = 'cluster'
+        else:
+            rds_type = 'db'
+
         if resource_id:
-            arn = self.build_arn_for_id(resource_id)
+            arn = self.build_arn_for_id(resource_id, rds_type)
             tags = self.conn.list_tags_for_resource(ResourceName=arn)['TagList']
 
             for tag in tags:
@@ -391,16 +397,15 @@ class RDSBackupManager(BaseBackupManager):
         return self.account_number
 
     def build_arn(self, instance):
-        return self.build_arn_for_id(instance['DBInstanceIdentifier'])
+        return self.build_arn_for_id(instance['DBInstanceIdentifier'],'db')
 
-    def build_arn_for_id(self, instance_id):
+    def build_arn_for_id(self, instance_id, rds_type):
         # "arn:aws:rds:<region>:<account number>:<resourcetype>:<name>"
 
         region = self.conn.meta.region_name
         account_number = self.resolve_account_number()
 
-        return "arn:aws:rds:{0}:{1}:db:{2}".format(region, account_number, instance_id)
-
+        return "arn:aws:rds:{0}:{1}:{2}:{3}".format(region, account_number, rds_type, instance_id)
 
 def lambda_handler(event, context={}):
     """
