@@ -4,10 +4,11 @@ import json
 import logging
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
+import os
+import functools
 
 import boto3
-import pytz
 
 
 class BaseBackupManager(object):
@@ -103,7 +104,7 @@ class BaseBackupManager(object):
                 deletelist = []
 
                 # Sort the list based on the dates of the objects
-                snapshots.sort(self.date_compare)
+                snapshots.sort(key=functools.cmp_to_key(self.date_compare))
 
                 for snap in snapshots:
                     sndesc = self.resolve_snapshot_name(snap)
@@ -120,7 +121,7 @@ class BaseBackupManager(object):
                                                              self.resolve_snapshot_time(snap))
                 self.message += "    ---------------------------\n"
 
-                deletelist.sort(self.date_compare)
+                deletelist.sort(key=functools.cmp_to_key(self.date_compare))
                 delta = len(deletelist) - self.keep_count
 
                 for i in range(delta):
@@ -163,7 +164,7 @@ class BaseBackupManager(object):
 
 
 class EC2BackupManager(BaseBackupManager):
-    def __init__(self, ec2_region_name, period, tag_name, tag_value, date_suffix, keep_count):
+    def __init__(self, region_name, period, tag_name, tag_value, date_suffix, keep_count):
         super(EC2BackupManager, self).__init__(period=period,
                                                tag_name=tag_name,
                                                tag_value=tag_value,
@@ -172,7 +173,7 @@ class EC2BackupManager(BaseBackupManager):
 
         # Connect to AWS using the credentials provided above or in Environment vars or using IAM role.
         print('Connecting to AWS')
-        self.conn = boto3.client('ec2', region_name=ec2_region_name)
+        self.conn = boto3.client('ec2', region_name=region_name)
 
     @staticmethod
     def date_compare(snap1, snap2):
@@ -199,7 +200,7 @@ class EC2BackupManager(BaseBackupManager):
 
     def set_resource_tags(self, resource, tags):
         resource_id = resource['SnapshotId']
-        for tag_key, tag_value in tags.iteritems():
+        for tag_key, tag_value in tags.items():
             print('Tagging %(resource_id)s with [%(tag_key)s: %(tag_value)s]' % {
                 'resource_id': resource_id,
                 'tag_key': tag_key,
@@ -208,6 +209,20 @@ class EC2BackupManager(BaseBackupManager):
 
             self.conn.create_tags(Resources=[resource_id],
                                   Tags=[{"Key": tag_key, "Value": tag_value}])
+
+    def share_snapshot(self, resource, ext_account):
+        resource_id = resource['SnapshotId']
+        print('Sharing %(resource_id)s with %(ext_account)s' % {
+            'resource_id': resource_id,
+            'ext_account': ext_account
+        })
+
+        self.conn.modify_snapshot_attribute(SnapshotId=resource_id,
+                              Attribute='createVolumePermission',
+                              OperationType='add',
+                              UserIds=[
+                                  ext_account
+                              ])
 
     def get_backable_resources(self):
         # Get all the volumes that match the tag criteria
@@ -226,6 +241,11 @@ class EC2BackupManager(BaseBackupManager):
         current_snap = self.conn.create_snapshot(VolumeId=self.resolve_backupable_id(resource),
                                                  Description=description)
         self.set_resource_tags(current_snap, tags)
+        try:
+            ext_account = (os.environ['EXT_ACCOUNT'])
+            self.share_snapshot(current_snap, ext_account)
+        except KeyError:
+            pass
 
     def list_snapshots_for_resource(self, resource):
         snapshots = self.conn.describe_snapshots(Filters=[
@@ -251,7 +271,7 @@ class EC2BackupManager(BaseBackupManager):
 class RDSBackupManager(BaseBackupManager):
     account_number = None
 
-    def __init__(self, rds_region_name, period, tag_name, tag_value, date_suffix, keep_count):
+    def __init__(self, region_name, period, tag_name, tag_value, date_suffix, keep_count):
         super(RDSBackupManager, self).__init__(period=period,
                                                tag_name=tag_name,
                                                tag_value=tag_value,
@@ -260,12 +280,11 @@ class RDSBackupManager(BaseBackupManager):
 
         # Connect to AWS using the credentials provided above or in Environment vars or using IAM role.
         print('Connecting to AWS')
-        self.conn = boto3.client('rds', region_name=rds_region_name)
+        self.conn = boto3.client('rds', region_name=region_name)
 
     @staticmethod
     def date_compare(snap1, snap2):
-        utc = pytz.UTC
-        now = datetime.utcnow().replace(tzinfo=utc)
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
         if snap1.get('SnapshotCreateTime', now) < snap2.get('SnapshotCreateTime', now):
             return -1
         elif snap1.get('SnapshotCreateTime', now) == snap2.get('SnapshotCreateTime', now):
@@ -294,9 +313,10 @@ class RDSBackupManager(BaseBackupManager):
                     resource_tags[tag['Key']] = tag['Value']
         return resource_tags
 
+    # This seems to not be in use for RDS
     def set_resource_tags(self, resource, tags):
         resource_id = resource['SnapshotId']
-        for tag_key, tag_value in tags.iteritems():
+        for tag_key, tag_value in tags.items():
             print('Tagging %(resource_id)s with [%(tag_key)s: %(tag_value)s]' % {
                 'resource_id': resource_id,
                 'tag_key': tag_key,
@@ -306,23 +326,46 @@ class RDSBackupManager(BaseBackupManager):
             self.conn.create_tags(Resources=[resource_id],
                                   Tags=[{"Key": tag_key, "Value": tag_value}])
 
+    def share_snapshot(self, resource, ext_account):
+        print('Sharing RDS Snapshot with %(ext_account)s' % {
+            'ext_account': ext_account
+        })
+        if 'DBClusterSnapshotIdentifier' in resource:
+            resource_id = resource['DBClusterSnapshotIdentifier']
+            self.conn.modify_db_cluster_snapshot_attribute(DBClusterSnapshotIdentifier=resource_id,
+                                  AttributeName='restore',
+                                  ValuesToAdd=[
+                                      ext_account
+                                  ])
+        else:
+            resource_id = resource['DBSnapshotIdentifier']
+            self.conn.modify_db_snapshot_attribute(DBSnapshotIdentifier=resource_id,
+                                  AttributeName='restore',
+                                  ValuesToAdd=[
+                                      ext_account
+                                  ])
+
     def get_backable_resources(self):
-        # Get all the volumes that match the tag criteria
+        # Get all the RDSes that match the tag criteria
         print('Finding databases that match the requested tag ({ "tag:%(tag_name)s": "%(tag_value)s" })' % {
             'tag_name': self.tag_name,
             'tag_value': self.tag_value
         })
-        all_instances = self.conn.describe_db_instances()['DBInstances']
         found = []
 
+        # Process Aurora clusters
+        all_clusters = self.conn.describe_db_clusters()['DBClusters']
+        for cluster in all_clusters:
+            if self.db_has_tag(cluster):
+                found.append(cluster)
+
+        # Process non-Aurora DB instances
+        all_instances = self.conn.describe_db_instances()['DBInstances']
         for db_instance in all_instances:
-            if self.db_has_tag(db_instance):
-                # prevent multiple cluster backup
-                if 'DBClusterIdentifier' in db_instance:
-                    if not any(d.get('DBClusterIdentifier', None) == db_instance['DBClusterIdentifier'] for d in found):
-                        found.append(db_instance)
-                    continue
-                found.append(db_instance)
+            # prevent adding instances belonging to cluster
+            if 'DBClusterIdentifier' not in db_instance:
+                if self.db_has_tag(db_instance):
+                    found.append(db_instance)
 
         print('Found %(count)s databases to manage' % {'count': len(found)})
 
@@ -341,11 +384,16 @@ class RDSBackupManager(BaseBackupManager):
             current_snap = self.conn.create_db_cluster_snapshot(
                 DBClusterIdentifier=self.resolve_backupable_id(resource),
                 DBClusterSnapshotIdentifier=snapshot_id,
-                Tags=aws_tagset)
+                Tags=aws_tagset)['DBClusterSnapshot']
         else:
             current_snap = self.conn.create_db_snapshot(DBInstanceIdentifier=self.resolve_backupable_id(resource),
                                                         DBSnapshotIdentifier=snapshot_id,
-                                                        Tags=aws_tagset)
+                                                        Tags=aws_tagset)['DBSnapshot']
+        try:
+            ext_account = (os.environ['EXT_ACCOUNT'])
+            self.share_snapshot(current_snap, ext_account)
+        except KeyError:
+            pass
 
     def list_snapshots_for_resource(self, resource):
         if 'DBClusterIdentifier' in resource:
@@ -397,7 +445,10 @@ class RDSBackupManager(BaseBackupManager):
         return self.account_number
 
     def build_arn(self, instance):
-        return self.build_arn_for_id(instance['DBInstanceIdentifier'],'db')
+        if 'DBClusterIdentifier' in instance:
+            return instance['DBClusterArn']
+        else:
+            return self.build_arn_for_id(instance['DBInstanceIdentifier'],'db')
 
     def build_arn_for_id(self, instance_id, rds_type):
         # "arn:aws:rds:<region>:<account number>:<resourcetype>:<name>"
@@ -414,11 +465,13 @@ def lambda_handler(event, context={}):
             "period_label": "day",
             "period_format": "%a%H",
 
-            "ec2_region_name": "ap-southeast-2",
-            "rds_region_name": "ap-southeast-2",
+            "region_name": "ap-southeast-2",
 
-            "tag_name": "MakeSnapshot",
-            "tag_value": "True",
+            "ec2_tag_name": "MakeSnapshot",
+            "ec2_tag_value": "True",
+
+            "rds_tag_name": "Environment",
+            "rds_tag_value": "prod",
 
             "arn": "blart",
 
@@ -434,11 +487,13 @@ def lambda_handler(event, context={}):
     period = event["period_label"]
     period_format = event["period_format"]
 
-    tag_name = event['tag_name']
-    tag_value = event['tag_value']
+    ec2_tag_name = event.get('ec2_tag_name', None)
+    ec2_tag_value = event.get('ec2_tag_value', None)
 
-    ec2_region_name = event.get('ec2_region_name', None)
-    rds_region_name = event.get('rds_region_name', None)
+    rds_tag_name = event.get('rds_tag_name', None)
+    rds_tag_value = event.get('rds_tag_value', None)
+
+    region_name = event['region_name']
 
     sns_arn = event.get('arn')
     error_sns_arn = event.get('error_arn')
@@ -447,11 +502,11 @@ def lambda_handler(event, context={}):
     date_suffix = datetime.today().strftime(period_format)
 
     result = event
-    if ec2_region_name:
-        backup_mgr = EC2BackupManager(ec2_region_name=ec2_region_name,
+    if ec2_tag_name and ec2_tag_value:
+        backup_mgr = EC2BackupManager(region_name=region_name,
                                       period=period,
-                                      tag_name=tag_name,
-                                      tag_value=tag_value,
+                                      tag_name=ec2_tag_name,
+                                      tag_value=ec2_tag_value,
                                       date_suffix=date_suffix,
                                       keep_count=keep_count)
 
@@ -466,7 +521,7 @@ def lambda_handler(event, context={}):
         # Connect to SNS
         if sns_arn or error_sns_arn:
             print('Connecting to SNS')
-            sns_boto = boto3.client('sns', region_name=ec2_region_name)
+            sns_boto = boto3.client('sns', region_name=region_name)
 
         if error_sns_arn and backup_mgr.errmsg:
             sns_boto.publish(TopicArn=error_sns_arn, Message='Error in processing volumes: ' + backup_mgr.errmsg,
@@ -475,11 +530,11 @@ def lambda_handler(event, context={}):
         if sns_arn:
             sns_boto.publish(TopicArn=sns_arn, Message=backup_mgr.message, Subject='Finished AWS EC2 snapshotting')
 
-    if rds_region_name:
-        backup_mgr = RDSBackupManager(rds_region_name=rds_region_name,
+    if rds_tag_name and rds_tag_value:
+        backup_mgr = RDSBackupManager(region_name=region_name,
                                       period=period,
-                                      tag_name=tag_name,
-                                      tag_value=tag_value,
+                                      tag_name=rds_tag_name,
+                                      tag_value=rds_tag_value,
                                       date_suffix=date_suffix,
                                       keep_count=keep_count)
 
@@ -494,7 +549,7 @@ def lambda_handler(event, context={}):
         # Connect to SNS
         if sns_arn or error_sns_arn:
             print('Connecting to SNS')
-            sns_boto = boto3.client('sns', region_name=rds_region_name)
+            sns_boto = boto3.client('sns', region_name=region_name)
 
         if error_sns_arn and backup_mgr.errmsg:
             sns_boto.publish(TopicArn=error_sns_arn, Message='Error in processing RDS: ' + backup_mgr.errmsg,

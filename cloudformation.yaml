@@ -90,6 +90,7 @@ Resources:
                     - "rds:DescribeDBSecurityGroups"
                     - "rds:CreateDBSnapshot"
                     - "rds:DeleteDBSnapshot"
+                    - "rds:DescribeDBClusters"
                     - "rds:DescribeDBClusterSnapshots"
                     - "rds:CreateDBClusterSnapshot"
                     - "rds:DeleteDBClusterSnapshot"
@@ -104,7 +105,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: backuplambda.lambda_handler
-      Runtime: python2.7
+      Runtime: python3.8
       Timeout: 300
       Role: !GetAtt LambdaExecutionRole.Arn
       CodeUri: 'lambda'
